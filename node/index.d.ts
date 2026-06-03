@@ -333,7 +333,7 @@ export interface CSSModulesConfig {
 
 export interface CSSModulePattern {
   /** The function to use to resolve patterns */
-  resolve: (hash: string, path: string, local: string, content_hash?: string) => string,
+  resolve: (hash: string, path: string, local: string, content_hash?: string) => MaybePromise<string>,
   /** Whether to pass in the content_hash param into `resolve`. */
   content_hash: boolean
 }
