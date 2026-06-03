@@ -131,7 +131,7 @@ fn handle_error<T>(tx: Sender<napi::Result<T>>, res: napi::Result<()>) -> napi::
 }
 
 fn await_promise<T, Cb>(env: Env, result: JsUnknown, tx: Sender<napi::Result<T>>, parse: Cb) -> napi::Result<()>
-  where
+where
   T: 'static,
   Cb: 'static + Fn(JsUnknown) -> Result<T, napi::Error>,
 {
@@ -167,7 +167,7 @@ mod bundle {
   use crossbeam_channel::{self, Receiver, Sender};
   use lightningcss::bundler::{FileProvider, ResolveResult};
   use napi::{Env, JsFunction, JsString, NapiRaw};
-  use std::path::{Path};
+  use std::path::Path;
   use std::sync::Mutex;
   use threadsafe_function::{ThreadSafeCallContext, ThreadsafeFunction, ThreadsafeFunctionCallMode};
 
@@ -177,7 +177,7 @@ mod bundle {
     let pattern = get_pattern(*ctx.env, &opts);
 
     let config: BundleConfig = ctx.env.from_js_value(opts)?;
-  println!("after js bundle");
+    println!("after js bundle");
     let fs = FileProvider::new();
 
     // This is pretty silly, but works around a rust limitation that you cannot
@@ -193,7 +193,7 @@ mod bundle {
       &fs,
       &config,
       visitor.as_mut().map(|visitor| annotate(|stylesheet| stylesheet.visit(visitor))),
-      pattern
+      pattern,
     );
 
     match res {
@@ -283,7 +283,6 @@ mod bundle {
     stylesheet: &'static mut StyleSheet<'static, AtRule<'static>>,
     tx: Sender<napi::Result<String>>,
   }
-
 
   fn resolve_on_js_thread(ctx: ThreadSafeCallContext<ResolveMessage>) -> napi::Result<()> {
     let specifier = ctx.env.create_string(&ctx.value.specifier)?;
@@ -415,16 +414,16 @@ mod bundle {
             })
           }
         }),
-        pattern
+        pattern,
       );
 
       deferred.resolve(move |env| {
-          let res = match res {
-            Ok(v) => v.into_js(env),
-            Err(err) => Err(err.into_js_error(env, None)?),
-          };
-          println!("res: {}", res.is_ok());
-          res
+        let res = match res {
+          Ok(v) => v.into_js(env),
+          Err(err) => Err(err.into_js_error(env, None)?),
+        };
+        println!("res: {}", res.is_ok());
+        res
       });
     });
 
@@ -476,7 +475,7 @@ mod bundle {
       &provider,
       &config,
       visitor.as_mut().map(|visitor| annotate(|stylesheet| stylesheet.visit(visitor))),
-      pattern
+      pattern,
     );
 
     match res {
@@ -635,7 +634,7 @@ struct CssModulesConfig {
 
 enum JsPattern {
   Simple(String),
-  Provider(PatternProvider)
+  Provider(PatternProvider),
 }
 
 struct WriteMessage {
@@ -662,26 +661,29 @@ impl std::fmt::Debug for PatternProvider {
 
 impl lightningcss::css_modules::PatternProvider for PatternProvider {
   fn write(
-      &self,
-      hash: &str,
-      path: &Path,
-      local: &str,
-      content_hash: Option<&str>,
-      dest: &mut dyn std::fmt::Write,
-    ) -> Result<(), std::fmt::Error> {
+    &self,
+    hash: &str,
+    path: &Path,
+    local: &str,
+    content_hash: Option<&str>,
+    dest: &mut dyn std::fmt::Write,
+  ) -> Result<(), std::fmt::Error> {
     let (tx, rx) = crossbeam_channel::unbounded::<napi::Result<String>>();
-    self.resolve.call(WriteMessage {
-      hash: hash.into(),
-      path: path.into(),
-      local: local.into(),
-      content_hash: content_hash.map(Into::into),
-      tx
-    }, crate::threadsafe_function::ThreadsafeFunctionCallMode::Blocking);
+    self.resolve.call(
+      WriteMessage {
+        hash: hash.into(),
+        path: path.into(),
+        local: local.into(),
+        content_hash: content_hash.map(Into::into),
+        tx,
+      },
+      crate::threadsafe_function::ThreadsafeFunctionCallMode::Blocking,
+    );
     dest.write_str(&rx.recv().unwrap().map_err(|_| std::fmt::Error)?)
   }
 
   fn needs_content_hash(&self) -> bool {
-      self.content_hash.is_some_and(|v| v)
+    self.content_hash.is_some_and(|v| v)
   }
 }
 
@@ -713,12 +715,15 @@ fn get_pattern(env: Env, opts: &JsObject) -> Option<JsPattern> {
   let css_modules = get_named_property::<JsObject>(opts, "cssModules").ok()?;
   let pattern = css_modules.get_named_property::<JsUnknown>("pattern").ok()?;
   match pattern.get_type().ok()? {
-    napi::ValueType::String => Some(JsPattern::Simple(pattern.coerce_to_string().unwrap().into_utf8().unwrap().into_owned().unwrap())),
+    napi::ValueType::String => Some(JsPattern::Simple(
+      pattern.coerce_to_string().unwrap().into_utf8().unwrap().into_owned().unwrap(),
+    )),
     napi::ValueType::Object => {
       let mut pattern = pattern.coerce_to_object().unwrap();
 
       let resolve = get_named_property::<napi::JsFunction>(&pattern, "resolve").ok()?;
-      let resolve = ThreadsafeFunction::create(env.raw(), unsafe { resolve.raw() }, 0, write_on_js_thread_wrapper).ok()?;
+      let resolve =
+        ThreadsafeFunction::create(env.raw(), unsafe { resolve.raw() }, 0, write_on_js_thread_wrapper).ok()?;
 
       // This is a workaround for a nasty bug caused by napi-rs
       // When deserializing, each field of an object is eagerly deserialized.
@@ -734,12 +739,9 @@ fn get_pattern(env: Env, opts: &JsObject) -> Option<JsPattern> {
         None
       };
 
-      Some(JsPattern::Provider(PatternProvider {
-        resolve,
-        content_hash
-      }))
+      Some(JsPattern::Provider(PatternProvider { resolve, content_hash }))
     }
-    _ => None
+    _ => None,
   }
 }
 
@@ -808,7 +810,7 @@ fn compile<'i>(
   code: &'i str,
   config: &Config,
   #[allow(unused_variables)] visitor: &mut Option<JsVisitor>,
-  pattern: Option<JsPattern>
+  pattern: Option<JsPattern>,
 ) -> Result<TransformResult<'i>, CompileError<'i, napi::Error>> {
   let drafts = config.drafts.as_ref();
   let non_standard = config.non_standard.as_ref();
@@ -853,7 +855,7 @@ fn compile<'i>(
                     Ok(p) => p,
                     Err(e) => return Err(CompileError::PatternError(e)),
                   },
-                  JsPattern::Provider(pattern) => lightningcss::css_modules::Pattern::Provider(Arc::new(pattern))
+                  JsPattern::Provider(pattern) => lightningcss::css_modules::Pattern::Provider(Arc::new(pattern)),
                 }
               } else {
                 Default::default()
@@ -949,7 +951,7 @@ fn compile_bundle<'i, 'o, P: SourceProvider, F: FnOnce(&mut StyleSheet<'i, AtRul
   fs: &'i P,
   config: &'o BundleConfig,
   visit: Option<F>,
-  pattern: Option<JsPattern>
+  pattern: Option<JsPattern>,
 ) -> Result<TransformResult<'i>, CompileError<'i, P::Error>> {
   use std::path::Path;
 
@@ -988,7 +990,7 @@ fn compile_bundle<'i, 'o, P: SourceProvider, F: FnOnce(&mut StyleSheet<'i, AtRul
                   Ok(p) => p,
                   Err(e) => return Err(CompileError::PatternError(e)),
                 },
-                JsPattern::Provider(pattern) => lightningcss::css_modules::Pattern::Provider(Arc::new(pattern))
+                JsPattern::Provider(pattern) => lightningcss::css_modules::Pattern::Provider(Arc::new(pattern)),
               }
             } else {
               Default::default()
