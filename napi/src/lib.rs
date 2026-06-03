@@ -13,12 +13,12 @@ use lightningcss::stylesheet::{
 };
 use lightningcss::targets::{Browsers, Features, Targets};
 use napi::bindgen_prelude::{FromNapiValue, ToNapiValue};
-use napi::{CallContext, Env, JsObject, JsUnknown, NapiRaw, Ref};
+use napi::{CallContext, Env, JsFunction, JsObject, JsString, JsUnknown, NapiRaw, Ref};
 use parcel_sourcemap::SourceMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 mod at_rule_parser;
 #[cfg(not(target_arch = "wasm32"))]
@@ -92,10 +92,9 @@ fn get_visitor(_env: Env, _opts: &JsObject) -> Option<JsVisitor> {
 pub fn transform(ctx: CallContext) -> napi::Result<JsUnknown> {
   let opts = ctx.get::<JsObject>(0)?;
   let mut visitor = get_visitor(*ctx.env, &opts);
-  let pattern = get_pattern(*ctx.env, &opts);
+  let pattern = get_pattern(*ctx.env, &opts)?;
 
   let config: Config = ctx.env.from_js_value(opts)?;
-  println!("after js transform");
   let code = unsafe { std::str::from_utf8_unchecked(&config.code) };
   let res = compile(code, &config, &mut visitor, pattern);
 
@@ -110,7 +109,6 @@ pub fn transform_style_attribute(ctx: CallContext) -> napi::Result<JsUnknown> {
   let mut visitor = get_visitor(*ctx.env, &opts);
 
   let config: AttrConfig = ctx.env.from_js_value(opts)?;
-  println!("after js transform_style_attribute");
   let code = unsafe { std::str::from_utf8_unchecked(&config.code) };
   let res = compile_attr(code, &config, &mut visitor);
 
@@ -139,7 +137,7 @@ where
   // Otherwise, send the result immediately.
   if result.is_promise()? {
     let result: JsObject = result.try_into()?;
-    let then: napi::JsFunction = get_named_property(&result, "then")?;
+    let then: JsFunction = get_named_property(&result, "then")?;
     let tx2 = tx.clone();
     let cb = env.create_function_from_closure("callback", move |ctx| {
       let res = parse(ctx.get::<JsUnknown>(0)?)?;
@@ -174,10 +172,9 @@ mod bundle {
   pub fn bundle(ctx: CallContext) -> napi::Result<JsUnknown> {
     let opts = ctx.get::<JsObject>(0)?;
     let mut visitor = get_visitor(*ctx.env, &opts);
-    let pattern = get_pattern(*ctx.env, &opts);
+    let pattern = get_pattern(*ctx.env, &opts)?;
 
     let config: BundleConfig = ctx.env.from_js_value(opts)?;
-    println!("after js bundle");
     let fs = FileProvider::new();
 
     // This is pretty silly, but works around a rust limitation that you cannot
@@ -314,7 +311,7 @@ mod bundle {
   pub fn bundle_async(ctx: CallContext) -> napi::Result<JsObject> {
     let opts = ctx.get::<JsObject>(0)?;
     let visitor = get_visitor(*ctx.env, &opts);
-    let pattern = get_pattern(*ctx.env, &opts);
+    let pattern = get_pattern(*ctx.env, &opts)?;
 
     let config: BundleConfig = ctx.env.from_js_value(&opts)?;
 
@@ -418,12 +415,10 @@ mod bundle {
       );
 
       deferred.resolve(move |env| {
-        let res = match res {
+        match res {
           Ok(v) => v.into_js(env),
           Err(err) => Err(err.into_js_error(env, None)?),
-        };
-        println!("res: {}", res.is_ok());
-        res
+        }
       });
     });
 
@@ -443,7 +438,7 @@ mod bundle {
   pub fn bundle(ctx: CallContext) -> napi::Result<JsUnknown> {
     let opts = ctx.get::<JsObject>(0)?;
     let mut visitor = get_visitor(*ctx.env, &opts);
-    let pattern = get_pattern(*ctx.env, &opts);
+    let pattern = get_pattern(*ctx.env, &opts)?;
 
     let resolver = get_named_property::<JsObject>(&opts, "resolver")?;
     let read = get_named_property::<JsFunction>(&resolver, "read")?;
@@ -653,7 +648,7 @@ struct PatternProvider {
 impl std::fmt::Debug for PatternProvider {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.debug_struct("PatternProvider")
-      .field("resolve", &"ThreadsafeFunction<PatternMessage>")
+      .field("resolve", &std::any::type_name_of_val(&self.resolve))
       .field("content_hash", &self.content_hash)
       .finish()
   }
@@ -687,7 +682,9 @@ impl lightningcss::css_modules::PatternProvider for PatternProvider {
   }
 }
 
-fn get_pattern(env: Env, opts: &JsObject) -> Option<JsPattern> {
+static RESOLVE_SYMBOL: std::sync::Mutex<OnceLock<Ref<()>>> = std::sync::Mutex::new(OnceLock::new());
+
+fn get_pattern(env: Env, opts: &JsObject) -> napi::Result<Option<JsPattern>> {
   fn write_on_js_thread(ctx: ThreadSafeCallContext<WriteMessage>) -> napi::Result<()> {
     let hash = ctx.env.create_string(&ctx.value.hash)?;
     let path = ctx.env.create_string(&ctx.value.path.to_string_lossy())?;
@@ -712,29 +709,56 @@ fn get_pattern(env: Env, opts: &JsObject) -> Option<JsPattern> {
     handle_error(tx, write_on_js_thread(ctx))
   }
 
-  let css_modules = get_named_property::<JsObject>(opts, "cssModules").ok()?;
-  let pattern = css_modules.get_named_property::<JsUnknown>("pattern").ok()?;
-  match pattern.get_type().ok()? {
+  let Ok(css_modules) = get_named_property::<JsObject>(opts, "cssModules") else {
+    return Ok(None);
+  };
+  let Ok(pattern) = css_modules.get_named_property::<JsUnknown>("pattern") else {
+    return Ok(None);
+  };
+
+  Ok(match pattern.get_type()? {
     napi::ValueType::String => Some(JsPattern::Simple(
-      pattern.coerce_to_string().unwrap().into_utf8().unwrap().into_owned().unwrap(),
+      JsString::try_from(pattern).expect("pattern should be a string").into_utf8().expect("pattern should be UTF-8").into_owned().unwrap(),
     )),
     napi::ValueType::Object => {
-      let mut pattern = pattern.coerce_to_object().unwrap();
+      let mut pattern = JsObject::try_from(pattern).expect("pattern should be an object");
 
-      let resolve = get_named_property::<napi::JsFunction>(&pattern, "resolve").ok()?;
-      let resolve =
-        ThreadsafeFunction::create(env.raw(), unsafe { resolve.raw() }, 0, write_on_js_thread_wrapper).ok()?;
+      let mut reference = RESOLVE_SYMBOL.lock().map_err(|e| napi::Error::new(napi::Status::GenericFailure, e))?;
 
-      // This is a workaround for a nasty bug caused by napi-rs
-      // When deserializing, each field of an object is eagerly deserialized.
-      // This causes issues when trying to deserialize functions, as those produce an error in the
-      // deserializer. To mitigate, we remove the field before it gets deserialized into the config.
-      // See: https://github.com/napi-rs/napi-rs/blob/b1239101d38c607a9ca427f8a8490a6ee168e91d/crates/napi/src/js_values/de.rs#L346-L363
-      pattern.delete_named_property("resolve").expect("pattern should be removed");
+      if reference.get().is_none() {
+        reference.set(env.create_reference(env.create_symbol(Some("__lightningcss_resolve__"))?)?).map_err(|_| ()).expect("RESOLVE_SYMBOL should not be initialized");
+      }
 
-      let content_hash = pattern.get_named_property::<JsUnknown>("contentHash").ok()?;
-      let content_hash = if matches!(content_hash.get_type(), Ok(napi::ValueType::Boolean)) {
-        content_hash.coerce_to_bool().ok().map(|v| v.get_value().ok()).flatten()
+      let reference: &mut napi::Ref<()> = reference.get_mut().expect("RESOLVE_SYMBOL should be initialized");
+
+      reference.reference(&env)?;
+      let symbol = env.get_reference_value::<napi::JsSymbol>(reference)?;
+
+      let resolve = if pattern.has_own_property_js(symbol).is_ok_and(|v| v) {
+        let resolve = pattern.get_property::<_, JsFunction>(symbol)?;
+        ThreadsafeFunction::create(env.raw(), unsafe { resolve.raw() }, 0, write_on_js_thread_wrapper)?
+      } else {
+        let resolve = get_named_property::<JsFunction>(&pattern, "resolve").map_err(|_| napi::Error::from_reason("pattern object should contain a `resolve` field"))?;
+        let func = ThreadsafeFunction::create(env.raw(), unsafe { resolve.raw() }, 0, write_on_js_thread_wrapper)?;
+
+        // This is a workaround for a nasty bug caused by napi-rs
+        // When deserializing, each field of an object is eagerly deserialized.
+        // This causes issues when trying to deserialize functions, as those produce an error in the
+        // deserializer. To mitigate, we move the field to a symbol based key before it gets deserialized into the config.
+        // See: https://github.com/napi-rs/napi-rs/blob/b1239101d38c607a9ca427f8a8490a6ee168e91d/crates/napi/src/js_values/de.rs#L346-L363
+        pattern.delete_named_property("resolve")?;
+        pattern.set_property(symbol, resolve)?;
+        func
+      };
+
+      reference.unref(env)?;
+
+      let content_hash = if let Ok(content_hash) = pattern.get_named_property::<JsUnknown>("contentHash") {
+        if matches!(content_hash.get_type(), Ok(napi::ValueType::Boolean)) {
+          content_hash.coerce_to_bool().ok().map(|v| v.get_value().ok()).flatten()
+        } else {
+          None
+        }
       } else {
         None
       };
@@ -742,7 +766,7 @@ fn get_pattern(env: Env, opts: &JsObject) -> Option<JsPattern> {
       Some(JsPattern::Provider(PatternProvider { resolve, content_hash }))
     }
     _ => None,
-  }
+  })
 }
 
 #[cfg(feature = "bundler")]
@@ -1235,7 +1259,7 @@ impl<'i, E: IntoJsError + std::error::Error> CompileError<'i, E> {
       | CompileError::MinifyError(Error { loc, .. })
       | CompileError::BundleError(Error { loc, .. }) => {
         // Generate an error with location information.
-        let syntax_error = env.get_global()?.get_named_property::<napi::JsFunction>("SyntaxError")?;
+        let syntax_error = env.get_global()?.get_named_property::<JsFunction>("SyntaxError")?;
         let reason = env.create_string_from_std(reason)?;
         let obj = syntax_error.new_instance(&[reason])?;
         (obj.into_unknown(), loc)
@@ -1274,7 +1298,7 @@ trait IntoJsError {
 impl IntoJsError for std::io::Error {
   fn into_js_error(self, env: Env) -> napi::Result<JsUnknown> {
     let reason = self.to_string();
-    let syntax_error = env.get_global()?.get_named_property::<napi::JsFunction>("SyntaxError")?;
+    let syntax_error = env.get_global()?.get_named_property::<JsFunction>("SyntaxError")?;
     let reason = env.create_string_from_std(reason)?;
     let obj = syntax_error.new_instance(&[reason])?;
     Ok(obj.into_unknown())
