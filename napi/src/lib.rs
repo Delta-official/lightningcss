@@ -1,6 +1,7 @@
 #[cfg(feature = "bundler")]
 use at_rule_parser::AtRule;
 use at_rule_parser::{CustomAtRuleConfig, CustomAtRuleParser};
+use crossbeam_channel::{Receiver, Sender};
 use lightningcss::bundler::BundleErrorKind;
 #[cfg(feature = "bundler")]
 use lightningcss::bundler::{Bundler, SourceProvider};
@@ -12,14 +13,14 @@ use lightningcss::stylesheet::{
 };
 use lightningcss::targets::{Browsers, Features, Targets};
 use napi::bindgen_prelude::{FromNapiValue, ToNapiValue};
-use napi::{CallContext, Env, JsObject, JsUnknown};
+use napi::{CallContext, Env, JsObject, JsUnknown, NapiRaw, Ref};
 use parcel_sourcemap::SourceMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 mod at_rule_parser;
-#[cfg(feature = "bundler")]
 #[cfg(not(target_arch = "wasm32"))]
 mod threadsafe_function;
 #[cfg(feature = "visitor")]
@@ -91,10 +92,12 @@ fn get_visitor(_env: Env, _opts: &JsObject) -> Option<JsVisitor> {
 pub fn transform(ctx: CallContext) -> napi::Result<JsUnknown> {
   let opts = ctx.get::<JsObject>(0)?;
   let mut visitor = get_visitor(*ctx.env, &opts);
+  let pattern = get_pattern(*ctx.env, &opts);
 
   let config: Config = ctx.env.from_js_value(opts)?;
+  println!("after js transform");
   let code = unsafe { std::str::from_utf8_unchecked(&config.code) };
-  let res = compile(code, &config, &mut visitor);
+  let res = compile(code, &config, &mut visitor, pattern);
 
   match res {
     Ok(res) => res.into_js(*ctx.env),
@@ -107,6 +110,7 @@ pub fn transform_style_attribute(ctx: CallContext) -> napi::Result<JsUnknown> {
   let mut visitor = get_visitor(*ctx.env, &opts);
 
   let config: AttrConfig = ctx.env.from_js_value(opts)?;
+  println!("after js transform_style_attribute");
   let code = unsafe { std::str::from_utf8_unchecked(&config.code) };
   let res = compile_attr(code, &config, &mut visitor);
 
@@ -116,23 +120,64 @@ pub fn transform_style_attribute(ctx: CallContext) -> napi::Result<JsUnknown> {
   }
 }
 
+fn handle_error<T>(tx: Sender<napi::Result<T>>, res: napi::Result<()>) -> napi::Result<()> {
+  match res {
+    Ok(_) => Ok(()),
+    Err(e) => {
+      tx.send(Err(e)).expect("send error");
+      Ok(())
+    }
+  }
+}
+
+fn await_promise<T, Cb>(env: Env, result: JsUnknown, tx: Sender<napi::Result<T>>, parse: Cb) -> napi::Result<()>
+  where
+  T: 'static,
+  Cb: 'static + Fn(JsUnknown) -> Result<T, napi::Error>,
+{
+  // If the result is a promise, wait for it to resolve, and send the result to the channel.
+  // Otherwise, send the result immediately.
+  if result.is_promise()? {
+    let result: JsObject = result.try_into()?;
+    let then: napi::JsFunction = get_named_property(&result, "then")?;
+    let tx2 = tx.clone();
+    let cb = env.create_function_from_closure("callback", move |ctx| {
+      let res = parse(ctx.get::<JsUnknown>(0)?)?;
+      tx.send(Ok(res)).unwrap();
+      ctx.env.get_undefined()
+    })?;
+    let eb = env.create_function_from_closure("error_callback", move |ctx| {
+      let res = ctx.get::<JsUnknown>(0)?;
+      tx2.send(Err(napi::Error::from(res))).unwrap();
+      ctx.env.get_undefined()
+    })?;
+    then.call(Some(&result), &[cb, eb])?;
+  } else {
+    let result = parse(result)?;
+    tx.send(Ok(result)).unwrap();
+  }
+
+  Ok(())
+}
+
 #[cfg(feature = "bundler")]
 #[cfg(not(target_arch = "wasm32"))]
 mod bundle {
   use super::*;
   use crossbeam_channel::{self, Receiver, Sender};
   use lightningcss::bundler::{FileProvider, ResolveResult};
-  use napi::{Env, JsBoolean, JsFunction, JsString, NapiRaw};
-  use std::path::{Path, PathBuf};
-  use std::str::FromStr;
+  use napi::{Env, JsFunction, JsString, NapiRaw};
+  use std::path::{Path};
   use std::sync::Mutex;
   use threadsafe_function::{ThreadSafeCallContext, ThreadsafeFunction, ThreadsafeFunctionCallMode};
 
   pub fn bundle(ctx: CallContext) -> napi::Result<JsUnknown> {
     let opts = ctx.get::<JsObject>(0)?;
     let mut visitor = get_visitor(*ctx.env, &opts);
+    let pattern = get_pattern(*ctx.env, &opts);
 
     let config: BundleConfig = ctx.env.from_js_value(opts)?;
+  println!("after js bundle");
     let fs = FileProvider::new();
 
     // This is pretty silly, but works around a rust limitation that you cannot
@@ -148,6 +193,7 @@ mod bundle {
       &fs,
       &config,
       visitor.as_mut().map(|visitor| annotate(|stylesheet| stylesheet.visit(visitor))),
+      pattern
     );
 
     match res {
@@ -238,35 +284,6 @@ mod bundle {
     tx: Sender<napi::Result<String>>,
   }
 
-  fn await_promise<T, Cb>(env: Env, result: JsUnknown, tx: Sender<napi::Result<T>>, parse: Cb) -> napi::Result<()>
-  where
-    T: 'static,
-    Cb: 'static + Fn(JsUnknown) -> Result<T, napi::Error>,
-  {
-    // If the result is a promise, wait for it to resolve, and send the result to the channel.
-    // Otherwise, send the result immediately.
-    if result.is_promise()? {
-      let result: JsObject = result.try_into()?;
-      let then: JsFunction = get_named_property(&result, "then")?;
-      let tx2 = tx.clone();
-      let cb = env.create_function_from_closure("callback", move |ctx| {
-        let res = parse(ctx.get::<JsUnknown>(0)?)?;
-        tx.send(Ok(res)).unwrap();
-        ctx.env.get_undefined()
-      })?;
-      let eb = env.create_function_from_closure("error_callback", move |ctx| {
-        let res = ctx.get::<JsUnknown>(0)?;
-        tx2.send(Err(napi::Error::from(res))).unwrap();
-        ctx.env.get_undefined()
-      })?;
-      then.call(Some(&result), &[cb, eb])?;
-    } else {
-      let result = parse(result)?;
-      tx.send(Ok(result)).unwrap();
-    }
-
-    Ok(())
-  }
 
   fn resolve_on_js_thread(ctx: ThreadSafeCallContext<ResolveMessage>) -> napi::Result<()> {
     let specifier = ctx.env.create_string(&ctx.value.specifier)?;
@@ -275,16 +292,6 @@ mod bundle {
     await_promise(ctx.env, result, ctx.value.tx, move |unknown| {
       ctx.env.from_js_value(unknown)
     })
-  }
-
-  fn handle_error<T>(tx: Sender<napi::Result<T>>, res: napi::Result<()>) -> napi::Result<()> {
-    match res {
-      Ok(_) => Ok(()),
-      Err(e) => {
-        tx.send(Err(e)).expect("send error");
-        Ok(())
-      }
-    }
   }
 
   fn resolve_on_js_thread_wrapper(ctx: ThreadSafeCallContext<ResolveMessage>) -> napi::Result<()> {
@@ -308,6 +315,7 @@ mod bundle {
   pub fn bundle_async(ctx: CallContext) -> napi::Result<JsObject> {
     let opts = ctx.get::<JsObject>(0)?;
     let visitor = get_visitor(*ctx.env, &opts);
+    let pattern = get_pattern(*ctx.env, &opts);
 
     let config: BundleConfig = ctx.env.from_js_value(&opts)?;
 
@@ -342,10 +350,10 @@ mod bundle {
         inputs: Mutex::new(Vec::new()),
       };
 
-      run_bundle_task(provider, config, visitor, *ctx.env)
+      run_bundle_task(provider, config, visitor, pattern, *ctx.env)
     } else {
       let provider = FileProvider::new();
-      run_bundle_task(provider, config, visitor, *ctx.env)
+      run_bundle_task(provider, config, visitor, pattern, *ctx.env)
     }
   }
 
@@ -357,6 +365,7 @@ mod bundle {
     provider: P,
     config: BundleConfig,
     visitor: Option<JsVisitor>,
+    pattern: Option<JsPattern>,
     env: Env,
   ) -> napi::Result<JsObject>
   where
@@ -406,11 +415,16 @@ mod bundle {
             })
           }
         }),
+        pattern
       );
 
-      deferred.resolve(move |env| match res {
-        Ok(v) => v.into_js(env),
-        Err(err) => Err(err.into_js_error(env, None)?),
+      deferred.resolve(move |env| {
+          let res = match res {
+            Ok(v) => v.into_js(env),
+            Err(err) => Err(err.into_js_error(env, None)?),
+          };
+          println!("res: {}", res.is_ok());
+          res
       });
     });
 
@@ -430,6 +444,7 @@ mod bundle {
   pub fn bundle(ctx: CallContext) -> napi::Result<JsUnknown> {
     let opts = ctx.get::<JsObject>(0)?;
     let mut visitor = get_visitor(*ctx.env, &opts);
+    let pattern = get_pattern(*ctx.env, &opts);
 
     let resolver = get_named_property::<JsObject>(&opts, "resolver")?;
     let read = get_named_property::<JsFunction>(&resolver, "read")?;
@@ -461,6 +476,7 @@ mod bundle {
       &provider,
       &config,
       visitor.as_mut().map(|visitor| annotate(|stylesheet| stylesheet.visit(visitor))),
+      pattern
     );
 
     match res {
@@ -557,6 +573,8 @@ mod bundle {
 #[cfg(feature = "bundler")]
 pub use bundle::*;
 
+use crate::threadsafe_function::{ThreadSafeCallContext, ThreadsafeFunction};
+
 // ---------------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -607,13 +625,122 @@ enum CssModulesOption {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CssModulesConfig {
-  pattern: Option<String>,
   dashed_idents: Option<bool>,
   animation: Option<bool>,
   container: Option<bool>,
   grid: Option<bool>,
   custom_idents: Option<bool>,
   pure: Option<bool>,
+}
+
+enum JsPattern {
+  Simple(String),
+  Provider(PatternProvider)
+}
+
+struct WriteMessage {
+  hash: String,
+  path: PathBuf,
+  local: String,
+  content_hash: Option<String>,
+  tx: Sender<napi::Result<String>>,
+}
+
+struct PatternProvider {
+  resolve: ThreadsafeFunction<WriteMessage>,
+  content_hash: Option<bool>,
+}
+
+impl std::fmt::Debug for PatternProvider {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("PatternProvider")
+      .field("resolve", &"ThreadsafeFunction<PatternMessage>")
+      .field("content_hash", &self.content_hash)
+      .finish()
+  }
+}
+
+impl lightningcss::css_modules::PatternProvider for PatternProvider {
+  fn write(
+      &self,
+      hash: &str,
+      path: &Path,
+      local: &str,
+      content_hash: Option<&str>,
+      dest: &mut dyn std::fmt::Write,
+    ) -> Result<(), std::fmt::Error> {
+    let (tx, rx) = crossbeam_channel::unbounded::<napi::Result<String>>();
+    self.resolve.call(WriteMessage {
+      hash: hash.into(),
+      path: path.into(),
+      local: local.into(),
+      content_hash: content_hash.map(Into::into),
+      tx
+    }, crate::threadsafe_function::ThreadsafeFunctionCallMode::Blocking);
+    dest.write_str(&rx.recv().unwrap().map_err(|_| std::fmt::Error)?)
+  }
+
+  fn needs_content_hash(&self) -> bool {
+      self.content_hash.is_some_and(|v| v)
+  }
+}
+
+fn get_pattern(env: Env, opts: &JsObject) -> Option<JsPattern> {
+  fn write_on_js_thread(ctx: ThreadSafeCallContext<WriteMessage>) -> napi::Result<()> {
+    let hash = ctx.env.create_string(&ctx.value.hash)?;
+    let path = ctx.env.create_string(&ctx.value.path.to_string_lossy())?;
+    let local = ctx.env.create_string(&ctx.value.local)?;
+
+    let result;
+
+    if let Some(content_hash) = ctx.value.content_hash {
+      let content_hash = ctx.env.create_string(&content_hash)?;
+      result = ctx.callback.unwrap().call(None, &[hash, path, local, content_hash])?
+    } else {
+      result = ctx.callback.unwrap().call(None, &[hash, path, local])?
+    }
+
+    await_promise(ctx.env, result, ctx.value.tx, |unknown| {
+      napi::JsString::try_from(unknown)?.into_utf8()?.into_owned()
+    })
+  }
+
+  fn write_on_js_thread_wrapper(ctx: ThreadSafeCallContext<WriteMessage>) -> napi::Result<()> {
+    let tx = ctx.value.tx.clone();
+    handle_error(tx, write_on_js_thread(ctx))
+  }
+
+  let css_modules = get_named_property::<JsObject>(opts, "cssModules").ok()?;
+  let pattern = css_modules.get_named_property::<JsUnknown>("pattern").ok()?;
+  match pattern.get_type().ok()? {
+    napi::ValueType::String => Some(JsPattern::Simple(pattern.coerce_to_string().unwrap().into_utf8().unwrap().into_owned().unwrap())),
+    napi::ValueType::Object => {
+      let mut pattern = pattern.coerce_to_object().unwrap();
+
+      let resolve = get_named_property::<napi::JsFunction>(&pattern, "resolve").ok()?;
+      let resolve = ThreadsafeFunction::create(env.raw(), unsafe { resolve.raw() }, 0, write_on_js_thread_wrapper).ok()?;
+
+      // This is a workaround for a nasty bug caused by napi-rs
+      // When deserializing, each field of an object is eagerly deserialized.
+      // This causes issues when trying to deserialize functions, as those produce an error in the
+      // deserializer. To mitigate, we remove the field before it gets deserialized into the config.
+      // See: https://github.com/napi-rs/napi-rs/blob/b1239101d38c607a9ca427f8a8490a6ee168e91d/crates/napi/src/js_values/de.rs#L346-L363
+      pattern.delete_named_property("resolve").expect("pattern should be removed");
+
+      let content_hash = pattern.get_named_property::<JsUnknown>("contentHash").ok()?;
+      let content_hash = if matches!(content_hash.get_type(), Ok(napi::ValueType::Boolean)) {
+        content_hash.coerce_to_bool().ok().map(|v| v.get_value().ok()).flatten()
+      } else {
+        None
+      };
+
+      Some(JsPattern::Provider(PatternProvider {
+        resolve,
+        content_hash
+      }))
+    }
+    _ => None
+  }
 }
 
 #[cfg(feature = "bundler")]
@@ -681,6 +808,7 @@ fn compile<'i>(
   code: &'i str,
   config: &Config,
   #[allow(unused_variables)] visitor: &mut Option<JsVisitor>,
+  pattern: Option<JsPattern>
 ) -> Result<TransformResult<'i>, CompileError<'i, napi::Error>> {
   let drafts = config.drafts.as_ref();
   let non_standard = config.non_standard.as_ref();
@@ -719,10 +847,13 @@ fn compile<'i>(
             CssModulesOption::Bool(true) => Some(lightningcss::css_modules::Config::default()),
             CssModulesOption::Bool(false) => None,
             CssModulesOption::Config(c) => Some(lightningcss::css_modules::Config {
-              pattern: if let Some(pattern) = c.pattern.as_ref() {
-                match lightningcss::css_modules::Pattern::parse(pattern) {
-                  Ok(p) => p,
-                  Err(e) => return Err(CompileError::PatternError(e)),
+              pattern: if let Some(pattern) = pattern {
+                match pattern {
+                  JsPattern::Simple(ref pattern) => match lightningcss::css_modules::Pattern::parse(pattern) {
+                    Ok(p) => p,
+                    Err(e) => return Err(CompileError::PatternError(e)),
+                  },
+                  JsPattern::Provider(pattern) => lightningcss::css_modules::Pattern::Provider(Arc::new(pattern))
                 }
               } else {
                 Default::default()
@@ -818,6 +949,7 @@ fn compile_bundle<'i, 'o, P: SourceProvider, F: FnOnce(&mut StyleSheet<'i, AtRul
   fs: &'i P,
   config: &'o BundleConfig,
   visit: Option<F>,
+  pattern: Option<JsPattern>
 ) -> Result<TransformResult<'i>, CompileError<'i, P::Error>> {
   use std::path::Path;
 
@@ -850,10 +982,13 @@ fn compile_bundle<'i, 'o, P: SourceProvider, F: FnOnce(&mut StyleSheet<'i, AtRul
           CssModulesOption::Bool(true) => Some(lightningcss::css_modules::Config::default()),
           CssModulesOption::Bool(false) => None,
           CssModulesOption::Config(c) => Some(lightningcss::css_modules::Config {
-            pattern: if let Some(pattern) = c.pattern.as_ref() {
-              match lightningcss::css_modules::Pattern::parse(pattern) {
-                Ok(p) => p,
-                Err(e) => return Err(CompileError::PatternError(e)),
+            pattern: if let Some(pattern) = pattern {
+              match pattern {
+                JsPattern::Simple(ref pattern) => match lightningcss::css_modules::Pattern::parse(pattern) {
+                  Ok(p) => p,
+                  Err(e) => return Err(CompileError::PatternError(e)),
+                },
+                JsPattern::Provider(pattern) => lightningcss::css_modules::Pattern::Provider(Arc::new(pattern))
               }
             } else {
               Default::default()
