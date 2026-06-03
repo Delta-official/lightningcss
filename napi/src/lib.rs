@@ -414,11 +414,9 @@ mod bundle {
         pattern,
       );
 
-      deferred.resolve(move |env| {
-        match res {
-          Ok(v) => v.into_js(env),
-          Err(err) => Err(err.into_js_error(env, None)?),
-        }
+      deferred.resolve(move |env| match res {
+        Ok(v) => v.into_js(env),
+        Err(err) => Err(err.into_js_error(env, None)?),
       });
     });
 
@@ -718,15 +716,25 @@ fn get_pattern(env: Env, opts: &JsObject) -> napi::Result<Option<JsPattern>> {
 
   Ok(match pattern.get_type()? {
     napi::ValueType::String => Some(JsPattern::Simple(
-      JsString::try_from(pattern).expect("pattern should be a string").into_utf8().expect("pattern should be UTF-8").into_owned().unwrap(),
+      JsString::try_from(pattern)
+        .expect("pattern should be a string")
+        .into_utf8()
+        .expect("pattern should be UTF-8")
+        .into_owned()
+        .unwrap(),
     )),
     napi::ValueType::Object => {
       let mut pattern = JsObject::try_from(pattern).expect("pattern should be an object");
 
-      let mut reference = RESOLVE_SYMBOL.lock().map_err(|e| napi::Error::new(napi::Status::GenericFailure, e))?;
+      let mut reference = RESOLVE_SYMBOL
+        .lock()
+        .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e))?;
 
       if reference.get().is_none() {
-        reference.set(env.create_reference(env.create_symbol(Some("__lightningcss_resolve__"))?)?).map_err(|_| ()).expect("RESOLVE_SYMBOL should not be initialized");
+        reference
+          .set(env.create_reference(env.create_symbol(Some("__lightningcss_resolve__"))?)?)
+          .map_err(|_| ())
+          .expect("RESOLVE_SYMBOL should not be initialized");
       }
 
       let reference: &mut napi::Ref<()> = reference.get_mut().expect("RESOLVE_SYMBOL should be initialized");
@@ -738,7 +746,8 @@ fn get_pattern(env: Env, opts: &JsObject) -> napi::Result<Option<JsPattern>> {
         let resolve = pattern.get_property::<_, JsFunction>(symbol)?;
         ThreadsafeFunction::create(env.raw(), unsafe { resolve.raw() }, 0, write_on_js_thread_wrapper)?
       } else {
-        let resolve = get_named_property::<JsFunction>(&pattern, "resolve").map_err(|_| napi::Error::from_reason("pattern object should contain a `resolve` field"))?;
+        let resolve = get_named_property::<JsFunction>(&pattern, "resolve")
+          .map_err(|_| napi::Error::from_reason("pattern object should contain a `resolve` field"))?;
         let func = ThreadsafeFunction::create(env.raw(), unsafe { resolve.raw() }, 0, write_on_js_thread_wrapper)?;
 
         // This is a workaround for a nasty bug caused by napi-rs
